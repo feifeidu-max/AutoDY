@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">AutoDY</string>
+    <string name="accessibility_summary">Triple blink swipe control</string>
+    <string name="accessibility_description">AutoDY uses accessibility to swipe up after triple blink detection.</string>
+</resources>
