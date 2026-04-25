@@ -7,7 +7,10 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
 import android.graphics.ImageFormat;
@@ -29,6 +32,8 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
+import android.os.Looper;
+import android.os.PowerManager;
 import android.os.SystemClock;
 import android.util.Log;
 import android.util.Size;
@@ -62,6 +67,9 @@ public class BlinkDetectionService extends Service {
     private static final int SNAP_MIN_PEAK = 9000;
     private static final int SNAP_MIN_DELTA = 5500;
     private static final float SNAP_MIN_RATIO = 4.5f;
+    private static final String MODE_IDLE = "IDLE";
+    private static final String MODE_MOUTH = "MOUTH";
+    private static final String MODE_SOUND = "SOUND";
 
     private static final SparseIntArray DEVICE_ORIENTATIONS = new SparseIntArray();
 
@@ -95,6 +103,32 @@ public class BlinkDetectionService extends Service {
     private AudioRecord audioRecord;
     private volatile boolean audioRunning;
     private double soundNoiseFloor = 700.0;
+    private boolean receiverRegistered;
+    private volatile boolean stoppingForScreenOff;
+    private String activeMode = MODE_IDLE;
+    private final Handler powerHandler = new Handler(Looper.getMainLooper());
+    private final BroadcastReceiver screenStateReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            String action = intent.getAction();
+            if (Intent.ACTION_SCREEN_OFF.equals(action)) {
+                stopDetectionForScreenOff("screen off broadcast");
+            }
+        }
+    };
+    private final Runnable powerWatchdog = new Runnable() {
+        @Override
+        public void run() {
+            if (!running) {
+                return;
+            }
+            if (!isScreenInteractive()) {
+                stopDetectionForScreenOff("power watchdog");
+                return;
+            }
+            powerHandler.postDelayed(this, 1000);
+        }
+    };
 
     public static boolean isRunning() {
         return running;
@@ -125,6 +159,7 @@ public class BlinkDetectionService extends Service {
                         .setMinFaceSize(0.18f)
                         .build()
         );
+        registerScreenStateReceiver();
     }
 
     @Override
@@ -141,17 +176,11 @@ public class BlinkDetectionService extends Service {
             return START_NOT_STICKY;
         }
 
-        int mode = BlinkSettings.getDetectionMode(this);
-        if (mode == BlinkSettings.MODE_SOUND) {
-            DebugLog.add(this, "Sound mode armed: snap detection from microphone");
-            closeCamera();
-            startAudioDetection();
-        } else {
-            DebugLog.add(this, "Mouth mode armed: interval=" + BlinkSettings.getMouthIntervalMs(this)
-                    + "ms openRatio>=" + MOUTH_OPEN_RATIO_THRESHOLD);
-            stopAudioDetection();
-            startCamera();
-        }
+        running = true;
+        stoppingForScreenOff = false;
+        DebugLog.add(this, "Service armed manual session");
+        startPowerWatchdog();
+        startConfiguredMode("start");
         return START_STICKY;
     }
 
@@ -164,6 +193,8 @@ public class BlinkDetectionService extends Service {
     public void onDestroy() {
         DebugLog.add(this, "Service onDestroy");
         running = false;
+        stopPowerWatchdog();
+        unregisterScreenStateReceiver();
         stopAudioDetection();
         closeCamera();
         if (faceDetector != null) {
@@ -183,6 +214,100 @@ public class BlinkDetectionService extends Service {
         } else {
             startForeground(NOTIFICATION_ID, notification);
         }
+    }
+
+    private void registerScreenStateReceiver() {
+        if (receiverRegistered) {
+            return;
+        }
+
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(Intent.ACTION_SCREEN_OFF);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(screenStateReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            registerReceiver(screenStateReceiver, filter);
+        }
+        receiverRegistered = true;
+    }
+
+    private void unregisterScreenStateReceiver() {
+        if (!receiverRegistered) {
+            return;
+        }
+
+        unregisterReceiver(screenStateReceiver);
+        receiverRegistered = false;
+    }
+
+    private void startConfiguredMode(String reason) {
+        int mode = BlinkSettings.getDetectionMode(this);
+        if (mode == BlinkSettings.MODE_SOUND) {
+            startSoundMode(reason);
+        } else {
+            startMouthMode(reason);
+        }
+    }
+
+    private void startPowerWatchdog() {
+        powerHandler.removeCallbacks(powerWatchdog);
+        powerHandler.post(powerWatchdog);
+    }
+
+    private void stopPowerWatchdog() {
+        powerHandler.removeCallbacks(powerWatchdog);
+    }
+
+    private boolean isScreenInteractive() {
+        PowerManager powerManager = (PowerManager) getSystemService(POWER_SERVICE);
+        return powerManager == null || powerManager.isInteractive();
+    }
+
+    private void stopDetectionForScreenOff(String reason) {
+        if (stoppingForScreenOff) {
+            return;
+        }
+
+        stoppingForScreenOff = true;
+        DebugLog.add(this, "Screen off: stop detection until manual start reason=" + reason);
+        enterStandby(reason);
+        running = false;
+        stopSelf();
+    }
+
+    private void enterStandby(String reason) {
+        boolean hadActiveMode = !MODE_IDLE.equals(activeMode);
+        stopAudioDetection();
+        closeCamera();
+        mouthOpen = false;
+        activeMode = MODE_IDLE;
+        updateNotification("Stopped: screen off");
+        DebugLog.add(this, (hadActiveMode ? "Detection paused" : "Standby")
+                + " reason=" + reason);
+    }
+
+    private void startMouthMode(String reason) {
+        if (MODE_MOUTH.equals(activeMode)) {
+            return;
+        }
+
+        stopAudioDetection();
+        activeMode = MODE_MOUTH;
+        DebugLog.add(this, "Mouth mode active reason=" + reason
+                + " interval=" + BlinkSettings.getMouthIntervalMs(this)
+                + "ms openRatio>=" + MOUTH_OPEN_RATIO_THRESHOLD);
+        startCamera();
+    }
+
+    private void startSoundMode(String reason) {
+        if (MODE_SOUND.equals(activeMode)) {
+            return;
+        }
+
+        closeCamera();
+        activeMode = MODE_SOUND;
+        DebugLog.add(this, "Sound mode active reason=" + reason);
+        startAudioDetection();
     }
 
     @SuppressLint("MissingPermission")
@@ -497,6 +622,10 @@ public class BlinkDetectionService extends Service {
         try {
             audioRecord.startRecording();
             while (audioRunning && audioRecord != null) {
+                if (!isScreenInteractive()) {
+                    powerHandler.post(() -> stopDetectionForScreenOff("audio loop"));
+                    break;
+                }
                 int read = audioRecord.read(buffer, 0, buffer.length);
                 if (read > 0) {
                     handleAudioSamples(buffer, read);

@@ -389,6 +389,7 @@ public class MainActivity extends Activity {
                         + "\n\u901a\u77e5\u6743\u9650\uff1a" + notification
                         + "\n\u65e0\u969c\u788d\u670d\u52a1\uff1a" + accessibility
                         + "\n\u540e\u53f0\u8bc6\u522b\uff1a" + service
+                        + "\n\u9501\u5c4f\u6216\u7184\u5c4f\uff1a\u81ea\u52a8\u5f85\u673a\u505c\u6b62\u68c0\u6d4b"
                         + "\n\u5f53\u524d\u6a21\u5f0f\uff1a" + mode
                         + "\n\u5634\u5df4\u68c0\u6d4b\u95f4\u9694\uff1a" + mouthIntervalMs + "ms"
         );
