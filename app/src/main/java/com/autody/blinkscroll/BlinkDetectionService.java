@@ -7,11 +7,11 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
-import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
 import android.graphics.ImageFormat;
+import android.graphics.PointF;
 import android.graphics.Rect;
 import android.hardware.camera2.CameraAccessException;
 import android.hardware.camera2.CameraCaptureSession;
@@ -20,6 +20,9 @@ import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CaptureRequest;
 import android.hardware.camera2.params.StreamConfigurationMap;
+import android.media.AudioFormat;
+import android.media.AudioRecord;
+import android.media.MediaRecorder;
 import android.media.Image;
 import android.media.ImageReader;
 import android.os.Build;
@@ -35,6 +38,7 @@ import android.view.WindowManager;
 
 import com.google.mlkit.vision.common.InputImage;
 import com.google.mlkit.vision.face.Face;
+import com.google.mlkit.vision.face.FaceContour;
 import com.google.mlkit.vision.face.FaceDetection;
 import com.google.mlkit.vision.face.FaceDetector;
 import com.google.mlkit.vision.face.FaceDetectorOptions;
@@ -53,6 +57,11 @@ public class BlinkDetectionService extends Service {
     private static final String CHANNEL_ID = "blink_detection";
     private static final int NOTIFICATION_ID = 1001;
     private static final long SWIPE_COOLDOWN_MS = 1800;
+    private static final float MOUTH_OPEN_RATIO_THRESHOLD = 0.055f;
+    private static final int SOUND_SAMPLE_RATE = 16000;
+    private static final int SNAP_MIN_PEAK = 9000;
+    private static final int SNAP_MIN_DELTA = 5500;
+    private static final float SNAP_MIN_RATIO = 4.5f;
 
     private static final SparseIntArray DEVICE_ORIENTATIONS = new SparseIntArray();
 
@@ -78,8 +87,14 @@ public class BlinkDetectionService extends Service {
     private long lastNotificationAt;
     private long lastFaceLogAt;
     private long lastNoFaceLogAt;
+    private long lastSoundLogAt;
+    private boolean mouthOpen;
     private boolean foregroundStarted;
-    private final BlinkTracker blinkTracker = new BlinkTracker();
+    private HandlerThread audioThread;
+    private Handler audioHandler;
+    private AudioRecord audioRecord;
+    private volatile boolean audioRunning;
+    private double soundNoiseFloor = 700.0;
 
     public static boolean isRunning() {
         return running;
@@ -91,7 +106,9 @@ public class BlinkDetectionService extends Service {
         DebugLog.add(this, "Service onCreate");
         createNotificationChannel();
         try {
-            startForegroundNow("Preparing camera");
+            startForegroundNow(BlinkSettings.getDetectionMode(this) == BlinkSettings.MODE_SOUND
+                    ? "Preparing microphone"
+                    : "Preparing camera");
             foregroundStarted = true;
             DebugLog.add(this, "Foreground notification started");
         } catch (RuntimeException exception) {
@@ -103,7 +120,8 @@ public class BlinkDetectionService extends Service {
         faceDetector = FaceDetection.getClient(
                 new FaceDetectorOptions.Builder()
                         .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
-                        .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
+                        .setContourMode(FaceDetectorOptions.CONTOUR_MODE_ALL)
+                        .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_NONE)
                         .setMinFaceSize(0.18f)
                         .build()
         );
@@ -123,14 +141,17 @@ public class BlinkDetectionService extends Service {
             return START_NOT_STICKY;
         }
 
-        DebugLog.add(this, "Blink tuning: frame="
-                + BlinkSettings.getFrameIntervalMs(this)
-                + "ms gap<="
-                + BlinkSettings.getBlinkGapMs(this)
-                + "ms series<="
-                + BlinkSettings.getSeriesWindowMs(this)
-                + "ms open>=0.65 closed<=0.35");
-        startCamera();
+        int mode = BlinkSettings.getDetectionMode(this);
+        if (mode == BlinkSettings.MODE_SOUND) {
+            DebugLog.add(this, "Sound mode armed: snap detection from microphone");
+            closeCamera();
+            startAudioDetection();
+        } else {
+            DebugLog.add(this, "Mouth mode armed: interval=" + BlinkSettings.getMouthIntervalMs(this)
+                    + "ms openRatio>=" + MOUTH_OPEN_RATIO_THRESHOLD);
+            stopAudioDetection();
+            startCamera();
+        }
         return START_STICKY;
     }
 
@@ -143,6 +164,7 @@ public class BlinkDetectionService extends Service {
     public void onDestroy() {
         DebugLog.add(this, "Service onDestroy");
         running = false;
+        stopAudioDetection();
         closeCamera();
         if (faceDetector != null) {
             faceDetector.close();
@@ -154,7 +176,10 @@ public class BlinkDetectionService extends Service {
     private void startForegroundNow(String text) {
         Notification notification = buildNotification(text);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA);
+            int foregroundType = BlinkSettings.getDetectionMode(this) == BlinkSettings.MODE_SOUND
+                    ? ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                    : ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA;
+            startForeground(NOTIFICATION_ID, notification, foregroundType);
         } else {
             startForeground(NOTIFICATION_ID, notification);
         }
@@ -280,7 +305,7 @@ public class BlinkDetectionService extends Service {
             requestBuilder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO);
             captureSession.setRepeatingRequest(requestBuilder.build(), null, cameraHandler);
             running = true;
-            updateNotification("Detecting triple blink");
+            updateNotification("Detecting open mouth");
             DebugLog.add(this, "Camera repeating request started");
         } catch (CameraAccessException exception) {
             Log.w(TAG, "Unable to start camera repeating request", exception);
@@ -296,8 +321,8 @@ public class BlinkDetectionService extends Service {
         }
 
         long now = SystemClock.elapsedRealtime();
-        int frameIntervalMs = BlinkSettings.getFrameIntervalMs(this);
-        if (processingFrame || now - lastFrameAt < frameIntervalMs) {
+        int mouthIntervalMs = BlinkSettings.getMouthIntervalMs(this);
+        if (processingFrame || now - lastFrameAt < mouthIntervalMs) {
             image.close();
             return;
         }
@@ -333,64 +358,212 @@ public class BlinkDetectionService extends Service {
                 lastNoFaceLogAt = now;
                 DebugLog.add(this, "No face detected. faces=" + faces.size());
             }
-            blinkTracker.resetIfIdle(now, this);
+            mouthOpen = false;
             return;
         }
 
-        Float left = face.getLeftEyeOpenProbability();
-        Float right = face.getRightEyeOpenProbability();
-        if (left == null || right == null || left < 0f || right < 0f) {
-            if (now - lastFaceLogAt > 1500) {
+        Float mouthOpenRatio = getMouthOpenRatio(face);
+        if (mouthOpenRatio == null) {
+            if (now - lastFaceLogAt > 2000) {
                 lastFaceLogAt = now;
-                DebugLog.add(this, "Face found but eye probabilities unavailable");
+                DebugLog.add(this, "Face found but mouth contours unavailable");
             }
             return;
         }
 
-        float eyeOpenScore = (left + right) / 2f;
-        boolean wasClosed = blinkTracker.isClosed();
-        int blinkCountBefore = blinkTracker.getBlinkCount();
-        boolean triggered = blinkTracker.acceptEyeScore(eyeOpenScore, now, this);
-        String trackerEvent = blinkTracker.getLastEvent();
-        boolean isClosed = blinkTracker.isClosed();
-        int blinkCountAfter = blinkTracker.getBlinkCount();
+        boolean wasMouthOpen = mouthOpen;
+        mouthOpen = mouthOpenRatio >= MOUTH_OPEN_RATIO_THRESHOLD;
 
-        if (now - lastFaceLogAt > 1000) {
+        if (now - lastFaceLogAt > 2000) {
             lastFaceLogAt = now;
             DebugLog.add(this, String.format(Locale.US,
-                    "faces=%d left=%.2f right=%.2f score=%.2f closed=%s blinks=%d gap=%dms frame=%dms accessibility=%s",
-                    faces.size(), left, right, eyeOpenScore, isClosed, blinkCountAfter,
-                    BlinkSettings.getBlinkGapMs(this), BlinkSettings.getFrameIntervalMs(this),
+                    "faces=%d mouthRatio=%.3f open=%s interval=%dms accessibility=%s",
+                    faces.size(), mouthOpenRatio, mouthOpen, BlinkSettings.getMouthIntervalMs(this),
                     BlinkAccessibilityService.isReady()));
         }
 
-        if (!wasClosed && isClosed) {
-            DebugLog.add(this, String.format(Locale.US, "Eyes closed score=%.2f", eyeOpenScore));
+        if (!wasMouthOpen && mouthOpen) {
+            DebugLog.add(this, String.format(Locale.US, "Mouth opened ratio=%.3f", mouthOpenRatio));
         }
-        if (wasClosed && !isClosed && blinkCountAfter != blinkCountBefore) {
-            DebugLog.add(this, "Blink accepted count=" + blinkCountAfter);
-        }
-        if (trackerEvent != null && trackerEvent.startsWith("Blink rejected")) {
-            DebugLog.add(this, trackerEvent);
-        }
-        if (trackerEvent != null && trackerEvent.startsWith("Blink series reset")) {
-            DebugLog.add(this, trackerEvent);
+        if (wasMouthOpen && !mouthOpen) {
+            DebugLog.add(this, String.format(Locale.US, "Mouth closed ratio=%.3f", mouthOpenRatio));
         }
 
-        if (triggered) {
-            DebugLog.add(this, "Triple blink detected");
-            if (now - lastSwipeAt >= SWIPE_COOLDOWN_MS) {
-                lastSwipeAt = now;
-                boolean dispatched = BlinkAccessibilityService.swipeUpFromCenter();
-                DebugLog.add(this, "Swipe dispatch result=" + dispatched);
-                updateNotification(dispatched ? "Swipe triggered" : "Enable accessibility first");
-            } else {
-                DebugLog.add(this, "Triple blink ignored by cooldown");
-            }
+        if (!wasMouthOpen && mouthOpen) {
+            DebugLog.add(this, "Open mouth detected");
+            triggerSwipe("Open mouth");
         } else if (now - lastNotificationAt > 5000) {
             updateNotification(BlinkAccessibilityService.isReady()
-                    ? "Detecting triple blink"
+                    ? "Detecting open mouth"
                     : "Waiting for accessibility");
+        }
+    }
+
+    private Float getMouthOpenRatio(Face face) {
+        FaceContour upperLip = face.getContour(FaceContour.UPPER_LIP_BOTTOM);
+        FaceContour lowerLip = face.getContour(FaceContour.LOWER_LIP_TOP);
+        if (upperLip == null || lowerLip == null
+                || upperLip.getPoints().isEmpty() || lowerLip.getPoints().isEmpty()) {
+            return null;
+        }
+
+        float upperY = averageY(upperLip.getPoints());
+        float lowerY = averageY(lowerLip.getPoints());
+        int faceHeight = Math.max(1, face.getBoundingBox().height());
+        float gap = Math.max(0f, lowerY - upperY);
+        return gap / faceHeight;
+    }
+
+    private float averageY(List<PointF> points) {
+        float sum = 0f;
+        for (PointF point : points) {
+            sum += point.y;
+        }
+        return sum / points.size();
+    }
+
+    private void triggerSwipe(String reason) {
+        long now = SystemClock.elapsedRealtime();
+        if (now - lastSwipeAt < SWIPE_COOLDOWN_MS) {
+            DebugLog.add(this, reason + " ignored by cooldown");
+            return;
+        }
+
+        lastSwipeAt = now;
+        boolean dispatched = BlinkAccessibilityService.swipeUpFromCenter();
+        DebugLog.add(this, "Swipe dispatch result=" + dispatched + " reason=" + reason);
+        updateNotification(dispatched ? "Swipe triggered" : "Enable accessibility first");
+    }
+
+    @SuppressLint("MissingPermission")
+    private void startAudioDetection() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+                && checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED) {
+            updateNotification("Microphone permission missing");
+            DebugLog.add(this, "Microphone permission missing");
+            stopSelf();
+            return;
+        }
+
+        stopAudioDetection();
+        int minBufferSize = AudioRecord.getMinBufferSize(
+                SOUND_SAMPLE_RATE,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT
+        );
+        if (minBufferSize <= 0) {
+            updateNotification("Microphone unavailable");
+            DebugLog.add(this, "AudioRecord min buffer invalid=" + minBufferSize);
+            stopSelf();
+            return;
+        }
+
+        int bufferSize = Math.max(minBufferSize, SOUND_SAMPLE_RATE / 4);
+        try {
+            audioRecord = new AudioRecord(
+                    MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                    SOUND_SAMPLE_RATE,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    bufferSize
+            );
+            if (audioRecord.getState() != AudioRecord.STATE_INITIALIZED) {
+                DebugLog.add(this, "AudioRecord init failed state=" + audioRecord.getState());
+                stopAudioDetection();
+                stopSelf();
+                return;
+            }
+
+            audioThread = new HandlerThread("SnapAudio");
+            audioThread.start();
+            audioHandler = new Handler(audioThread.getLooper());
+            audioRunning = true;
+            running = true;
+            updateNotification("Detecting finger snap");
+            DebugLog.add(this, "Audio detection started sampleRate=" + SOUND_SAMPLE_RATE
+                    + " buffer=" + bufferSize);
+            audioHandler.post(() -> readAudioLoop(bufferSize));
+        } catch (RuntimeException exception) {
+            Log.w(TAG, "Unable to start audio detection", exception);
+            DebugLog.add(this, "Audio start failed: " + exception.getMessage());
+            stopAudioDetection();
+            stopSelf();
+        }
+    }
+
+    private void readAudioLoop(int bufferSize) {
+        short[] buffer = new short[Math.max(256, bufferSize / 2)];
+        try {
+            audioRecord.startRecording();
+            while (audioRunning && audioRecord != null) {
+                int read = audioRecord.read(buffer, 0, buffer.length);
+                if (read > 0) {
+                    handleAudioSamples(buffer, read);
+                }
+            }
+        } catch (RuntimeException exception) {
+            Log.w(TAG, "Audio read failed", exception);
+            DebugLog.add(this, "Audio read failed: " + exception.getMessage());
+        }
+    }
+
+    private void handleAudioSamples(short[] buffer, int read) {
+        int peak = 0;
+        long sum = 0;
+        for (int i = 0; i < read; i++) {
+            int value = Math.abs((int) buffer[i]);
+            peak = Math.max(peak, value);
+            sum += value;
+        }
+
+        double average = sum / (double) read;
+        soundNoiseFloor = soundNoiseFloor * 0.92 + average * 0.08;
+        double ratio = peak / Math.max(1.0, soundNoiseFloor);
+        double delta = peak - soundNoiseFloor;
+        long now = SystemClock.elapsedRealtime();
+
+        if (now - lastSoundLogAt > 2000) {
+            lastSoundLogAt = now;
+            DebugLog.add(this, String.format(Locale.US,
+                    "sound peak=%d noise=%.0f ratio=%.1f accessibility=%s",
+                    peak, soundNoiseFloor, ratio, BlinkAccessibilityService.isReady()));
+        }
+
+        if (peak >= SNAP_MIN_PEAK && delta >= SNAP_MIN_DELTA && ratio >= SNAP_MIN_RATIO) {
+            DebugLog.add(this, String.format(Locale.US,
+                    "Finger snap detected peak=%d noise=%.0f ratio=%.1f",
+                    peak, soundNoiseFloor, ratio));
+            triggerSwipe("Finger snap");
+            soundNoiseFloor = Math.max(soundNoiseFloor, peak * 0.45);
+        }
+    }
+
+    private void stopAudioDetection() {
+        audioRunning = false;
+
+        if (audioRecord != null) {
+            try {
+                if (audioRecord.getRecordingState() == AudioRecord.RECORDSTATE_RECORDING) {
+                    audioRecord.stop();
+                }
+            } catch (IllegalStateException ignored) {
+            }
+            audioRecord.release();
+            audioRecord = null;
+            DebugLog.add(this, "AudioRecord released");
+        }
+
+        if (audioThread != null) {
+            audioThread.quitSafely();
+            try {
+                audioThread.join(1000);
+            } catch (InterruptedException interruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            audioThread = null;
+            audioHandler = null;
+            DebugLog.add(this, "Audio thread stopped");
         }
     }
 
@@ -539,10 +712,10 @@ public class BlinkDetectionService extends Service {
 
         NotificationChannel channel = new NotificationChannel(
                 CHANNEL_ID,
-                "Blink detection",
+                "Mouth detection",
                 NotificationManager.IMPORTANCE_LOW
         );
-        channel.setDescription("Front camera blink detection service");
+        channel.setDescription("Front camera mouth detection service");
         NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         manager.createNotificationChannel(channel);
     }
@@ -559,110 +732,4 @@ public class BlinkDetectionService extends Service {
         }
     }
 
-    private static final class BlinkTracker {
-        private static final float CLOSED_THRESHOLD = 0.35f;
-        private static final float OPEN_THRESHOLD = 0.65f;
-        private static final long MIN_CLOSED_MS = 45;
-        private static final long MAX_CLOSED_MS = 700;
-        private static final long MIN_BLINK_GAP_MS = 120;
-
-        private boolean closed;
-        private long closedAt;
-        private long firstBlinkAt;
-        private long lastBlinkAt;
-        private int blinkCount;
-        private String lastEvent;
-
-        boolean acceptEyeScore(float eyeOpenScore, long now, Context context) {
-            lastEvent = null;
-            resetIfIdle(now, context);
-
-            if (!closed && eyeOpenScore <= CLOSED_THRESHOLD) {
-                closed = true;
-                closedAt = now;
-                return false;
-            }
-
-            if (closed && eyeOpenScore >= OPEN_THRESHOLD) {
-                long closedDuration = now - closedAt;
-                closed = false;
-                if (closedDuration < MIN_CLOSED_MS) {
-                    reset();
-                    lastEvent = "Blink rejected: closed too short " + closedDuration + "ms";
-                    return false;
-                }
-                if (closedDuration > MAX_CLOSED_MS) {
-                    reset();
-                    lastEvent = "Blink rejected: closed too long " + closedDuration + "ms";
-                    return false;
-                }
-                return registerBlink(now, context);
-            }
-
-            return false;
-        }
-
-        void resetIfIdle(long now, Context context) {
-            int maxBlinkGapMs = BlinkSettings.getBlinkGapMs(context);
-            int maxSeriesMs = BlinkSettings.getSeriesWindowMs(maxBlinkGapMs);
-            if (blinkCount > 0 && now - lastBlinkAt > maxBlinkGapMs) {
-                lastEvent = "Blink series reset: gap " + (now - lastBlinkAt)
-                        + "ms > " + maxBlinkGapMs + "ms";
-                reset();
-            }
-            if (firstBlinkAt > 0 && now - firstBlinkAt > maxSeriesMs) {
-                lastEvent = "Blink series reset: series " + (now - firstBlinkAt)
-                        + "ms > " + maxSeriesMs + "ms";
-                reset();
-            }
-        }
-
-        boolean isClosed() {
-            return closed;
-        }
-
-        int getBlinkCount() {
-            return blinkCount;
-        }
-
-        String getLastEvent() {
-            return lastEvent;
-        }
-
-        private boolean registerBlink(long now, Context context) {
-            int maxBlinkGapMs = BlinkSettings.getBlinkGapMs(context);
-            int maxSeriesMs = BlinkSettings.getSeriesWindowMs(maxBlinkGapMs);
-            long gap = blinkCount == 0 ? 0 : now - lastBlinkAt;
-            if (blinkCount > 0 && gap < MIN_BLINK_GAP_MS) {
-                lastEvent = "Blink rejected: gap too short " + gap + "ms";
-                return false;
-            }
-
-            if (blinkCount == 0 || gap <= maxBlinkGapMs) {
-                if (blinkCount == 0) {
-                    firstBlinkAt = now;
-                }
-                blinkCount++;
-                lastBlinkAt = now;
-            } else {
-                blinkCount = 1;
-                firstBlinkAt = now;
-                lastBlinkAt = now;
-            }
-
-            if (blinkCount >= 3 && now - firstBlinkAt <= maxSeriesMs) {
-                reset();
-                return true;
-            }
-            return false;
-        }
-
-        private void reset() {
-            closed = false;
-            closedAt = 0;
-            firstBlinkAt = 0;
-            lastBlinkAt = 0;
-            blinkCount = 0;
-        }
-    }
 }

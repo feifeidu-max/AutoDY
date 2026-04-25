@@ -3,6 +3,14 @@ package com.autody.blinkscroll;
 import android.content.Context;
 
 public final class BlinkSettings {
+    public static final int MODE_MOUTH = 0;
+    public static final int MODE_SOUND = 1;
+    public static final int DEFAULT_DETECTION_MODE = MODE_MOUTH;
+    public static final int DEFAULT_MOUTH_INTERVAL_MS = 1000;
+    public static final int MIN_MOUTH_INTERVAL_MS = 1000;
+    public static final int MAX_MOUTH_INTERVAL_MS = 5000;
+    public static final int MOUTH_INTERVAL_STEP_MS = 250;
+
     public static final int DEFAULT_BLINK_GAP_MS = 1150;
     public static final int MIN_BLINK_GAP_MS = 500;
     public static final int MAX_BLINK_GAP_MS = 3000;
@@ -13,10 +21,63 @@ public final class BlinkSettings {
     public static final int FRAME_INTERVAL_STEP_MS = 10;
 
     private static final String PREFS_NAME = "blink_settings";
+    private static final String KEY_DETECTION_MODE = "detection_mode";
+    private static final String KEY_MOUTH_INTERVAL_MS = "mouth_interval_ms";
     private static final String KEY_BLINK_GAP_MS = "blink_gap_ms";
     private static final String KEY_FRAME_INTERVAL_MS = "frame_interval_ms";
 
     private BlinkSettings() {
+    }
+
+    public static int getDetectionMode(Context context) {
+        int value = context.getApplicationContext()
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getInt(KEY_DETECTION_MODE, DEFAULT_DETECTION_MODE);
+        return value == MODE_SOUND ? MODE_SOUND : MODE_MOUTH;
+    }
+
+    public static void setDetectionMode(Context context, int mode) {
+        int value = mode == MODE_SOUND ? MODE_SOUND : MODE_MOUTH;
+        context.getApplicationContext()
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putInt(KEY_DETECTION_MODE, value)
+                .apply();
+    }
+
+    public static String getDetectionModeLabel(Context context) {
+        return getDetectionMode(context) == MODE_SOUND ? "声音识别" : "张嘴识别";
+    }
+
+    public static int getMouthIntervalMs(Context context) {
+        int value = context.getApplicationContext()
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getInt(KEY_MOUTH_INTERVAL_MS, DEFAULT_MOUTH_INTERVAL_MS);
+        return clampToStep(value, MIN_MOUTH_INTERVAL_MS, MAX_MOUTH_INTERVAL_MS,
+                MOUTH_INTERVAL_STEP_MS);
+    }
+
+    public static void setMouthIntervalMs(Context context, int value) {
+        int clamped = clampToStep(value, MIN_MOUTH_INTERVAL_MS, MAX_MOUTH_INTERVAL_MS,
+                MOUTH_INTERVAL_STEP_MS);
+        context.getApplicationContext()
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putInt(KEY_MOUTH_INTERVAL_MS, clamped)
+                .apply();
+    }
+
+    public static int progressToMouthIntervalMs(int progress) {
+        return MIN_MOUTH_INTERVAL_MS + progress * MOUTH_INTERVAL_STEP_MS;
+    }
+
+    public static int mouthIntervalMsToProgress(int intervalMs) {
+        return (clampToStep(intervalMs, MIN_MOUTH_INTERVAL_MS, MAX_MOUTH_INTERVAL_MS,
+                MOUTH_INTERVAL_STEP_MS) - MIN_MOUTH_INTERVAL_MS) / MOUTH_INTERVAL_STEP_MS;
+    }
+
+    public static int maxMouthIntervalProgress() {
+        return (MAX_MOUTH_INTERVAL_MS - MIN_MOUTH_INTERVAL_MS) / MOUTH_INTERVAL_STEP_MS;
     }
 
     public static int getBlinkGapMs(Context context) {

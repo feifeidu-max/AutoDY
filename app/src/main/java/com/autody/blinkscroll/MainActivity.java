@@ -51,8 +51,10 @@ public class MainActivity extends Activity {
     };
 
     private TextView statusView;
-    private TextView blinkGapValueView;
-    private TextView frameIntervalValueView;
+    private TextView modeValueView;
+    private TextView mouthIntervalValueView;
+    private Button mouthModeButton;
+    private Button soundModeButton;
     private TextView logView;
     private Button startButton;
     private boolean startAfterPermission;
@@ -88,10 +90,11 @@ public class MainActivity extends Activity {
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         DebugLog.add(this, "Permission result: camera=" + hasCameraPermission()
+                + " microphone=" + hasMicrophonePermission()
                 + " notification=" + hasNotificationPermission());
         if (requestCode == REQUEST_PERMISSIONS && startAfterPermission) {
             startAfterPermission = false;
-            if (hasCameraPermission()) {
+            if (hasNeededModePermission()) {
                 startDetection();
             }
         }
@@ -121,7 +124,7 @@ public class MainActivity extends Activity {
         content.addView(title, matchWrap());
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("\u4e09\u8fde\u7728\u773c\uff0c\u4e0a\u6ed1\u5237\u4e0b\u4e00\u6761");
+        subtitle.setText("\u5f20\u5634\u6216\u54cd\u6307\u89e6\u53d1\u4e0a\u6ed1");
         subtitle.setTextColor(Color.rgb(75, 85, 99));
         subtitle.setTextSize(16);
         subtitle.setGravity(Gravity.CENTER);
@@ -137,7 +140,7 @@ public class MainActivity extends Activity {
         startButton = primaryButton("\u5f00\u59cb\u8bc6\u522b");
         startButton.setOnClickListener(view -> {
             DebugLog.add(this, "Start button tapped");
-            if (!hasCameraPermission() || !hasNotificationPermission()) {
+            if (!hasNeededModePermission() || !hasNotificationPermission()) {
                 startAfterPermission = true;
                 requestNeededPermissions();
             } else {
@@ -188,7 +191,7 @@ public class MainActivity extends Activity {
         content.addView(clearButton, buttonParams(dp(12)));
 
         TextView note = new TextView(this);
-        note.setText("\u8c03\u6574\u540e\u4f1a\u7acb\u5373\u4fdd\u5b58\u5e76\u5f71\u54cd\u8bc6\u522b\u3002\u5e27\u95f4\u9694\u8d8a\u5c0f\u8d8a\u7075\u654f\uff0c\u4f46\u4e5f\u66f4\u8017\u7535\u3002\u5982\u679c\u4e09\u8fde\u7728\u773c\u6ca1\u53cd\u5e94\uff0c\u8bf7\u590d\u5236\u6700\u540e\u51e0\u5341\u884c\u65e5\u5fd7\u53d1\u7ed9\u6211\u3002");
+        note.setText("\u5207\u6362\u6a21\u5f0f\u540e\u9700\u8981\u91cd\u65b0\u70b9\u51fb\u5f00\u59cb\u8bc6\u522b\u3002\u5982\u679c\u5f20\u5634\u6216\u54cd\u6307\u6ca1\u53cd\u5e94\uff0c\u8bf7\u590d\u5236\u6700\u540e\u51e0\u5341\u884c\u65e5\u5fd7\u53d1\u7ed9\u6211\u3002");
         note.setTextColor(Color.rgb(107, 114, 128));
         note.setTextSize(13);
         note.setLineSpacing(0, 1.2f);
@@ -215,20 +218,36 @@ public class MainActivity extends Activity {
         panel.setBackground(makePanelBackground());
         content.addView(panel, matchWrap());
 
-        blinkGapValueView = settingLabel();
-        panel.addView(blinkGapValueView, matchWrap());
+        modeValueView = settingLabel();
+        panel.addView(modeValueView, matchWrap());
 
-        SeekBar blinkGapSeekBar = new SeekBar(this);
-        blinkGapSeekBar.setMax(BlinkSettings.maxBlinkGapProgress());
-        blinkGapSeekBar.setProgress(BlinkSettings.blinkGapMsToProgress(
-                BlinkSettings.getBlinkGapMs(this)));
-        blinkGapSeekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+        LinearLayout modeRow = new LinearLayout(this);
+        modeRow.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams modeRowParams = matchWrap();
+        modeRowParams.setMargins(0, dp(8), 0, dp(16));
+        panel.addView(modeRow, modeRowParams);
+
+        mouthModeButton = secondaryButton("\u5f20\u5634\u8bc6\u522b");
+        soundModeButton = secondaryButton("\u58f0\u97f3\u8bc6\u522b");
+        mouthModeButton.setOnClickListener(view -> setDetectionMode(BlinkSettings.MODE_MOUTH));
+        soundModeButton.setOnClickListener(view -> setDetectionMode(BlinkSettings.MODE_SOUND));
+        modeRow.addView(mouthModeButton, rowButtonParams(0, dp(6)));
+        modeRow.addView(soundModeButton, rowButtonParams(dp(6), 0));
+
+        mouthIntervalValueView = settingLabel();
+        panel.addView(mouthIntervalValueView, matchWrap());
+
+        SeekBar mouthIntervalSeekBar = new SeekBar(this);
+        mouthIntervalSeekBar.setMax(BlinkSettings.maxMouthIntervalProgress());
+        mouthIntervalSeekBar.setProgress(BlinkSettings.mouthIntervalMsToProgress(
+                BlinkSettings.getMouthIntervalMs(this)));
+        mouthIntervalSeekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
                 if (fromUser) {
-                    BlinkSettings.setBlinkGapMs(
+                    BlinkSettings.setMouthIntervalMs(
                             MainActivity.this,
-                            BlinkSettings.progressToBlinkGapMs(progress)
+                            BlinkSettings.progressToMouthIntervalMs(progress)
                     );
                     refreshStatus();
                 }
@@ -240,53 +259,14 @@ public class MainActivity extends Activity {
 
             @Override
             public void onStopTrackingTouch(SeekBar seekBar) {
-                DebugLog.add(MainActivity.this, "Blink gap setting="
-                        + BlinkSettings.getBlinkGapMs(MainActivity.this) + "ms"
-                        + " series=" + BlinkSettings.getSeriesWindowMs(MainActivity.this) + "ms");
+                DebugLog.add(MainActivity.this, "Mouth interval setting="
+                        + BlinkSettings.getMouthIntervalMs(MainActivity.this) + "ms");
             }
         });
-        panel.addView(blinkGapSeekBar, matchWrap());
-
-        TextView blinkGapHint = settingHint(
-                "\u8d8a\u5c0f\u8981\u6c42\u4e09\u8fde\u8d8a\u5feb\uff0c\u8bef\u89e6\u66f4\u5c11\uff1b\u8d8a\u5927\u8d8a\u5bb9\u6613\u89e6\u53d1\u3002"
-        );
-        LinearLayout.LayoutParams blinkHintParams = matchWrap();
-        blinkHintParams.setMargins(0, 0, 0, dp(16));
-        panel.addView(blinkGapHint, blinkHintParams);
-
-        frameIntervalValueView = settingLabel();
-        panel.addView(frameIntervalValueView, matchWrap());
-
-        SeekBar frameIntervalSeekBar = new SeekBar(this);
-        frameIntervalSeekBar.setMax(BlinkSettings.maxFrameIntervalProgress());
-        frameIntervalSeekBar.setProgress(BlinkSettings.frameIntervalMsToProgress(
-                BlinkSettings.getFrameIntervalMs(this)));
-        frameIntervalSeekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-            @Override
-            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                if (fromUser) {
-                    BlinkSettings.setFrameIntervalMs(
-                            MainActivity.this,
-                            BlinkSettings.progressToFrameIntervalMs(progress)
-                    );
-                    refreshStatus();
-                }
-            }
-
-            @Override
-            public void onStartTrackingTouch(SeekBar seekBar) {
-            }
-
-            @Override
-            public void onStopTrackingTouch(SeekBar seekBar) {
-                DebugLog.add(MainActivity.this, "Frame interval setting="
-                        + BlinkSettings.getFrameIntervalMs(MainActivity.this) + "ms");
-            }
-        });
-        panel.addView(frameIntervalSeekBar, matchWrap());
+        panel.addView(mouthIntervalSeekBar, matchWrap());
 
         panel.addView(settingHint(
-                "\u8d8a\u5c0f\u8d8a\u7075\u654f\u4f46\u66f4\u8017\u7535\uff1b\u8d8a\u5927\u8d8a\u7701\u7535\uff0c\u4f46\u5feb\u901f\u7728\u773c\u53ef\u80fd\u6f0f\u8bc6\u522b\u3002"
+                "\u5f20\u5634\u6a21\u5f0f\u4e0b\u751f\u6548\uff0c\u53ef\u5728 1000ms \u5230 5000ms \u4e4b\u95f4\u8c03\u8282\u3002\u58f0\u97f3\u6a21\u5f0f\u4f1a\u76d1\u542c\u9ea6\u514b\u98ce\u5e76\u8bc6\u522b\u54cd\u6307\u5cf0\u503c\u3002"
         ), matchWrap());
 
         refreshSettingLabels();
@@ -318,10 +298,26 @@ public class MainActivity extends Activity {
                 Toast.LENGTH_SHORT).show();
     }
 
+    private void setDetectionMode(int mode) {
+        int previous = BlinkSettings.getDetectionMode(this);
+        BlinkSettings.setDetectionMode(this, mode);
+        int current = BlinkSettings.getDetectionMode(this);
+        if (previous != current) {
+            DebugLog.add(this, "Detection mode setting=" + BlinkSettings.getDetectionModeLabel(this));
+            if (BlinkDetectionService.isRunning()) {
+                stopDetection();
+            }
+        }
+        refreshStatus();
+    }
+
     private void requestNeededPermissions() {
         List<String> permissions = new ArrayList<>();
-        if (!hasCameraPermission()) {
+        if (BlinkSettings.getDetectionMode(this) == BlinkSettings.MODE_MOUTH && !hasCameraPermission()) {
             permissions.add(Manifest.permission.CAMERA);
+        }
+        if (BlinkSettings.getDetectionMode(this) == BlinkSettings.MODE_SOUND && !hasMicrophonePermission()) {
+            permissions.add(Manifest.permission.RECORD_AUDIO);
         }
         if (!hasNotificationPermission()) {
             permissions.add(Manifest.permission.POST_NOTIFICATIONS);
@@ -333,6 +329,17 @@ public class MainActivity extends Activity {
     private boolean hasCameraPermission() {
         return Build.VERSION.SDK_INT < Build.VERSION_CODES.M
                 || checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private boolean hasMicrophonePermission() {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.M
+                || checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private boolean hasNeededModePermission() {
+        return BlinkSettings.getDetectionMode(this) == BlinkSettings.MODE_SOUND
+                ? hasMicrophonePermission()
+                : hasCameraPermission();
     }
 
     private boolean hasNotificationPermission() {
@@ -369,21 +376,21 @@ public class MainActivity extends Activity {
         }
 
         String camera = hasCameraPermission() ? "\u5df2\u5141\u8bb8" : "\u672a\u5141\u8bb8";
+        String microphone = hasMicrophonePermission() ? "\u5df2\u5141\u8bb8" : "\u672a\u5141\u8bb8";
         String notification = hasNotificationPermission() ? "\u5df2\u5141\u8bb8" : "\u672a\u5141\u8bb8";
         String accessibility = isAccessibilityEnabled() ? "\u5df2\u5f00\u542f" : "\u672a\u5f00\u542f";
         String service = BlinkDetectionService.isRunning() ? "\u8bc6\u522b\u4e2d" : "\u672a\u8fd0\u884c";
-        int blinkGapMs = BlinkSettings.getBlinkGapMs(this);
-        int seriesWindowMs = BlinkSettings.getSeriesWindowMs(blinkGapMs);
-        int frameIntervalMs = BlinkSettings.getFrameIntervalMs(this);
+        String mode = BlinkSettings.getDetectionModeLabel(this);
+        int mouthIntervalMs = BlinkSettings.getMouthIntervalMs(this);
 
         statusView.setText(
                 "\u76f8\u673a\u6743\u9650\uff1a" + camera
+                        + "\n\u9ea6\u514b\u98ce\u6743\u9650\uff1a" + microphone
                         + "\n\u901a\u77e5\u6743\u9650\uff1a" + notification
                         + "\n\u65e0\u969c\u788d\u670d\u52a1\uff1a" + accessibility
                         + "\n\u540e\u53f0\u8bc6\u522b\uff1a" + service
-                        + "\n\u7728\u773c\u95f4\u9694\u7a97\u53e3\uff1a" + blinkGapMs + "ms"
-                        + "\n\u4e09\u8fde\u603b\u7a97\u53e3\uff1a" + seriesWindowMs + "ms"
-                        + "\n\u5e27\u5904\u7406\u95f4\u9694\uff1a" + frameIntervalMs + "ms"
+                        + "\n\u5f53\u524d\u6a21\u5f0f\uff1a" + mode
+                        + "\n\u5634\u5df4\u68c0\u6d4b\u95f4\u9694\uff1a" + mouthIntervalMs + "ms"
         );
 
         if (startButton != null) {
@@ -401,15 +408,23 @@ public class MainActivity extends Activity {
     }
 
     private void refreshSettingLabels() {
-        if (blinkGapValueView != null) {
-            int blinkGapMs = BlinkSettings.getBlinkGapMs(this);
-            blinkGapValueView.setText("\u7728\u773c\u95f4\u9694\u7a97\u53e3\uff1a"
-                    + blinkGapMs + "ms\uff08\u4e09\u8fde\u603b\u7a97\u53e3 "
-                    + BlinkSettings.getSeriesWindowMs(blinkGapMs) + "ms\uff09");
+        int mode = BlinkSettings.getDetectionMode(this);
+        if (modeValueView != null) {
+            modeValueView.setText("\u8bc6\u522b\u6a21\u5f0f\uff1a" + BlinkSettings.getDetectionModeLabel(this));
         }
-        if (frameIntervalValueView != null) {
-            frameIntervalValueView.setText("\u5e27\u5904\u7406\u95f4\u9694\uff1a"
-                    + BlinkSettings.getFrameIntervalMs(this) + "ms");
+        if (mouthIntervalValueView != null) {
+            mouthIntervalValueView.setText("\u5634\u5df4\u68c0\u6d4b\u95f4\u9694\uff1a"
+                    + BlinkSettings.getMouthIntervalMs(this) + "ms");
+        }
+        if (mouthModeButton != null) {
+            mouthModeButton.setText(mode == BlinkSettings.MODE_MOUTH
+                    ? "\u5f20\u5634\u8bc6\u522b \u2713"
+                    : "\u5f20\u5634\u8bc6\u522b");
+        }
+        if (soundModeButton != null) {
+            soundModeButton.setText(mode == BlinkSettings.MODE_SOUND
+                    ? "\u58f0\u97f3\u8bc6\u522b \u2713"
+                    : "\u58f0\u97f3\u8bc6\u522b");
         }
     }
 
@@ -523,6 +538,16 @@ public class MainActivity extends Activity {
     private LinearLayout.LayoutParams buttonParams(int topMargin) {
         LinearLayout.LayoutParams params = matchWrap();
         params.setMargins(0, topMargin, 0, 0);
+        return params;
+    }
+
+    private LinearLayout.LayoutParams rowButtonParams(int leftMargin, int rightMargin) {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                0,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                1f
+        );
+        params.setMargins(leftMargin, 0, rightMargin, 0);
         return params;
     }
 

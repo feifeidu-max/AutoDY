@@ -59,7 +59,7 @@ public class BlinkAccessibilityService extends AccessibilityService {
         GestureDescription gesture = new GestureDescription.Builder()
                 .addStroke(new GestureDescription.StrokeDescription(path, 0, 360))
                 .build();
-        DebugLog.add(service, "Dispatch swipe x=" + Math.round(x)
+        DebugLog.add(service, "Dispatch swipe up x=" + Math.round(x)
                 + " startY=" + Math.round(startY)
                 + " endY=" + Math.round(endY));
         return service.dispatchGesture(gesture, null, null);
