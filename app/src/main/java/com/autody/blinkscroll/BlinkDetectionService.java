@@ -69,6 +69,7 @@ public class BlinkDetectionService extends Service {
     private static final long SWIPE_COOLDOWN_MS = 1800;
     private static final float FACE_CHANGE_TRIGGER_SCORE = 0.18f;
     private static final float FACE_CHANGE_RESET_SCORE = 0.08f;
+    private static final float FACE_HEAD_SHAKE_TRIGGER_SCORE = 0.16f;
     private static final long FRAME_PROCESSING_TIMEOUT_MS = 5000;
     private static final long CAMERA_STALE_TIMEOUT_MS = 12000;
     private static final long CAMERA_RESTART_COOLDOWN_MS = 10000;
@@ -132,6 +133,9 @@ public class BlinkDetectionService extends Service {
     private Float lastFaceCenterY;
     private Float lastFaceSizeRatio;
     private Float lastFaceMouthRatio;
+    private Float lastFaceYaw;
+    private Float lastFacePitch;
+    private Float lastFaceRoll;
     private boolean receiverRegistered;
     private volatile boolean stoppingForScreenOff;
     private String activeMode = MODE_IDLE;
@@ -547,6 +551,13 @@ public class BlinkDetectionService extends Service {
         float moveScore = 0f;
         float sizeScore = 0f;
         float mouthScore = 0f;
+        float headScore = 0f;
+        float yawScore = 0f;
+        float pitchScore = 0f;
+        float rollScore = 0f;
+        float yaw = face.getHeadEulerAngleY();
+        float pitch = face.getHeadEulerAngleX();
+        float roll = face.getHeadEulerAngleZ();
 
         if (lastFaceCenterX != null && lastFaceCenterY != null && lastFaceSizeRatio != null) {
             float dx = centerX - lastFaceCenterX;
@@ -556,11 +567,19 @@ public class BlinkDetectionService extends Service {
             if (mouthOpenRatio != null && lastFaceMouthRatio != null) {
                 mouthScore = Math.abs(mouthOpenRatio - lastFaceMouthRatio);
             }
+            if (lastFaceYaw != null && lastFacePitch != null && lastFaceRoll != null) {
+                yawScore = Math.abs(yaw - lastFaceYaw) / 22f;
+                pitchScore = Math.abs(pitch - lastFacePitch) / 26f;
+                rollScore = Math.abs(roll - lastFaceRoll) / 28f;
+                headScore = Math.max(yawScore, Math.max(pitchScore * 0.85f, rollScore * 0.75f));
+            }
         }
 
-        float faceChangeScore = moveScore * 0.65f + sizeScore * 1.6f + mouthScore * 1.8f;
+        float expressionScore = moveScore * 0.65f + sizeScore * 1.6f + mouthScore * 1.8f;
+        float faceChangeScore = Math.max(expressionScore, headScore);
         boolean wasFaceChangeActive = faceChangeActive;
-        faceChangeActive = faceChangeScore >= FACE_CHANGE_TRIGGER_SCORE;
+        faceChangeActive = expressionScore >= FACE_CHANGE_TRIGGER_SCORE
+                || headScore >= FACE_HEAD_SHAKE_TRIGGER_SCORE;
         if (faceChangeScore <= FACE_CHANGE_RESET_SCORE) {
             faceChangeActive = false;
         }
@@ -569,8 +588,9 @@ public class BlinkDetectionService extends Service {
         if (now - lastFaceLogAt > 2000) {
             lastFaceLogAt = now;
             DebugLog.add(this, String.format(Locale.US,
-                    "faces=%d change=%.3f move=%.3f size=%.3f mouth=%.3f active=%s interval=%dms accessibility=%s",
+                    "faces=%d change=%.3f move=%.3f size=%.3f mouth=%.3f head=%.3f yaw=%.3f pitch=%.3f roll=%.3f active=%s interval=%dms accessibility=%s",
                     faces.size(), faceChangeScore, moveScore, sizeScore, mouthScore,
+                    headScore, yawScore, pitchScore, rollScore,
                     faceChangeActive, BlinkSettings.getMouthIntervalMs(this),
                     BlinkAccessibilityService.isReady()));
         }
@@ -578,10 +598,11 @@ public class BlinkDetectionService extends Service {
         if (faceChangeActive && now - lastFaceChangeTriggerAt >= SWIPE_COOLDOWN_MS) {
             lastFaceChangeTriggerAt = now;
             DebugLog.add(this, String.format(Locale.US,
-                    "Face change detected change=%.3f move=%.3f size=%.3f mouth=%.3f",
-                    faceChangeScore, moveScore, sizeScore, mouthScore));
+                    "Face change detected change=%.3f move=%.3f size=%.3f mouth=%.3f head=%.3f yaw=%.3f pitch=%.3f roll=%.3f",
+                    faceChangeScore, moveScore, sizeScore, mouthScore,
+                    headScore, yawScore, pitchScore, rollScore));
             triggerSwipe("Face change");
-            resetFaceChangeBaseline(centerX, centerY, sizeRatio, mouthOpenRatio);
+            resetFaceChangeBaseline(centerX, centerY, sizeRatio, mouthOpenRatio, yaw, pitch, roll);
             faceChangeActive = false;
             return;
         } else if (wasFaceChangeActive && !faceChangeActive) {
@@ -595,7 +616,7 @@ public class BlinkDetectionService extends Service {
                     : "Waiting for accessibility");
         }
 
-        resetFaceChangeBaseline(centerX, centerY, sizeRatio, mouthOpenRatio);
+        resetFaceChangeBaseline(centerX, centerY, sizeRatio, mouthOpenRatio, yaw, pitch, roll);
     }
 
     private void resetFaceChangeState() {
@@ -604,14 +625,20 @@ public class BlinkDetectionService extends Service {
         lastFaceCenterY = null;
         lastFaceSizeRatio = null;
         lastFaceMouthRatio = null;
+        lastFaceYaw = null;
+        lastFacePitch = null;
+        lastFaceRoll = null;
     }
 
     private void resetFaceChangeBaseline(float centerX, float centerY, float sizeRatio,
-            Float mouthOpenRatio) {
+            Float mouthOpenRatio, float yaw, float pitch, float roll) {
         lastFaceCenterX = centerX;
         lastFaceCenterY = centerY;
         lastFaceSizeRatio = sizeRatio;
         lastFaceMouthRatio = mouthOpenRatio;
+        lastFaceYaw = yaw;
+        lastFacePitch = pitch;
+        lastFaceRoll = roll;
     }
 
     private void checkCameraHealth() {
