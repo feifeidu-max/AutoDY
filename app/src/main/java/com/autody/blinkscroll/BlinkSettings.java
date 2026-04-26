@@ -19,12 +19,22 @@ public final class BlinkSettings {
     public static final int MIN_FRAME_INTERVAL_MS = 40;
     public static final int MAX_FRAME_INTERVAL_MS = 300;
     public static final int FRAME_INTERVAL_STEP_MS = 10;
+    public static final int DEFAULT_SOUND_THRESHOLD = 2500;
+    public static final int MIN_SOUND_THRESHOLD = 100;
+    public static final int MAX_SOUND_THRESHOLD = 10000;
+    public static final int SOUND_THRESHOLD_STEP = 100;
+    public static final int DEFAULT_SOUND_INTERVAL_MS = 20;
+    public static final int MIN_SOUND_INTERVAL_MS = 10;
+    public static final int MAX_SOUND_INTERVAL_MS = 2000;
+    public static final int SOUND_INTERVAL_STEP_MS = 10;
 
     private static final String PREFS_NAME = "blink_settings";
     private static final String KEY_DETECTION_MODE = "detection_mode";
     private static final String KEY_MOUTH_INTERVAL_MS = "mouth_interval_ms";
     private static final String KEY_BLINK_GAP_MS = "blink_gap_ms";
     private static final String KEY_FRAME_INTERVAL_MS = "frame_interval_ms";
+    private static final String KEY_SOUND_THRESHOLD = "sound_threshold";
+    private static final String KEY_SOUND_INTERVAL_MS = "sound_interval_ms";
 
     private BlinkSettings() {
     }
@@ -144,6 +154,67 @@ public final class BlinkSettings {
 
     public static int maxFrameIntervalProgress() {
         return (MAX_FRAME_INTERVAL_MS - MIN_FRAME_INTERVAL_MS) / FRAME_INTERVAL_STEP_MS;
+    }
+
+    public static int getSoundThreshold(Context context) {
+        int value = context.getApplicationContext()
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getInt(KEY_SOUND_THRESHOLD, DEFAULT_SOUND_THRESHOLD);
+        return clampToStep(value, MIN_SOUND_THRESHOLD, MAX_SOUND_THRESHOLD, SOUND_THRESHOLD_STEP);
+    }
+
+    public static void setSoundThreshold(Context context, int value) {
+        int clamped = clampToStep(value, MIN_SOUND_THRESHOLD, MAX_SOUND_THRESHOLD,
+                SOUND_THRESHOLD_STEP);
+        context.getApplicationContext()
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putInt(KEY_SOUND_THRESHOLD, clamped)
+                .apply();
+    }
+
+    public static int progressToSoundThreshold(int progress) {
+        return MIN_SOUND_THRESHOLD + progress * SOUND_THRESHOLD_STEP;
+    }
+
+    public static int soundThresholdToProgress(int threshold) {
+        return (clampToStep(threshold, MIN_SOUND_THRESHOLD, MAX_SOUND_THRESHOLD,
+                SOUND_THRESHOLD_STEP) - MIN_SOUND_THRESHOLD) / SOUND_THRESHOLD_STEP;
+    }
+
+    public static int maxSoundThresholdProgress() {
+        return (MAX_SOUND_THRESHOLD - MIN_SOUND_THRESHOLD) / SOUND_THRESHOLD_STEP;
+    }
+
+    public static int getSoundIntervalMs(Context context) {
+        int value = context.getApplicationContext()
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getInt(KEY_SOUND_INTERVAL_MS, DEFAULT_SOUND_INTERVAL_MS);
+        return clampToStep(value, MIN_SOUND_INTERVAL_MS, MAX_SOUND_INTERVAL_MS,
+                SOUND_INTERVAL_STEP_MS);
+    }
+
+    public static void setSoundIntervalMs(Context context, int value) {
+        int clamped = clampToStep(value, MIN_SOUND_INTERVAL_MS, MAX_SOUND_INTERVAL_MS,
+                SOUND_INTERVAL_STEP_MS);
+        context.getApplicationContext()
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putInt(KEY_SOUND_INTERVAL_MS, clamped)
+                .apply();
+    }
+
+    public static int progressToSoundIntervalMs(int progress) {
+        return MIN_SOUND_INTERVAL_MS + progress * SOUND_INTERVAL_STEP_MS;
+    }
+
+    public static int soundIntervalMsToProgress(int value) {
+        return (clampToStep(value, MIN_SOUND_INTERVAL_MS, MAX_SOUND_INTERVAL_MS,
+                SOUND_INTERVAL_STEP_MS) - MIN_SOUND_INTERVAL_MS) / SOUND_INTERVAL_STEP_MS;
+    }
+
+    public static int maxSoundIntervalProgress() {
+        return (MAX_SOUND_INTERVAL_MS - MIN_SOUND_INTERVAL_MS) / SOUND_INTERVAL_STEP_MS;
     }
 
     private static int clampToStep(int value, int min, int max, int step) {

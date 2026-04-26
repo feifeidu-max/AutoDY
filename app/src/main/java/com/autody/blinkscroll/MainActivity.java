@@ -53,6 +53,8 @@ public class MainActivity extends Activity {
     private TextView statusView;
     private TextView modeValueView;
     private TextView mouthIntervalValueView;
+    private TextView soundThresholdValueView;
+    private TextView soundIntervalValueView;
     private Button mouthModeButton;
     private Button soundModeButton;
     private TextView logView;
@@ -265,8 +267,74 @@ public class MainActivity extends Activity {
         });
         panel.addView(mouthIntervalSeekBar, matchWrap());
 
+        soundThresholdValueView = settingLabel();
+        LinearLayout.LayoutParams soundThresholdLabelParams = matchWrap();
+        soundThresholdLabelParams.setMargins(0, dp(14), 0, 0);
+        panel.addView(soundThresholdValueView, soundThresholdLabelParams);
+
+        SeekBar soundThresholdSeekBar = new SeekBar(this);
+        soundThresholdSeekBar.setMax(BlinkSettings.maxSoundThresholdProgress());
+        soundThresholdSeekBar.setProgress(BlinkSettings.soundThresholdToProgress(
+                BlinkSettings.getSoundThreshold(this)));
+        soundThresholdSeekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                if (fromUser) {
+                    BlinkSettings.setSoundThreshold(
+                            MainActivity.this,
+                            BlinkSettings.progressToSoundThreshold(progress)
+                    );
+                    refreshStatus();
+                }
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar seekBar) {
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {
+                DebugLog.add(MainActivity.this, "Sound threshold setting="
+                        + BlinkSettings.getSoundThreshold(MainActivity.this));
+            }
+        });
+        panel.addView(soundThresholdSeekBar, matchWrap());
+
+        soundIntervalValueView = settingLabel();
+        LinearLayout.LayoutParams soundIntervalLabelParams = matchWrap();
+        soundIntervalLabelParams.setMargins(0, dp(14), 0, 0);
+        panel.addView(soundIntervalValueView, soundIntervalLabelParams);
+
+        SeekBar soundIntervalSeekBar = new SeekBar(this);
+        soundIntervalSeekBar.setMax(BlinkSettings.maxSoundIntervalProgress());
+        soundIntervalSeekBar.setProgress(BlinkSettings.soundIntervalMsToProgress(
+                BlinkSettings.getSoundIntervalMs(this)));
+        soundIntervalSeekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                if (fromUser) {
+                    BlinkSettings.setSoundIntervalMs(
+                            MainActivity.this,
+                            BlinkSettings.progressToSoundIntervalMs(progress)
+                    );
+                    refreshStatus();
+                }
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar seekBar) {
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {
+                DebugLog.add(MainActivity.this, "Sound interval setting="
+                        + BlinkSettings.getSoundIntervalMs(MainActivity.this) + "ms");
+            }
+        });
+        panel.addView(soundIntervalSeekBar, matchWrap());
+
         panel.addView(settingHint(
-                "\u5f20\u5634\u6a21\u5f0f\u4e0b\u751f\u6548\uff0c\u53ef\u5728 1000ms \u5230 5000ms \u4e4b\u95f4\u8c03\u8282\u3002\u58f0\u97f3\u6a21\u5f0f\u4f1a\u76d1\u542c\u9ea6\u514b\u98ce\u5e76\u8bc6\u522b\u54cd\u6307\u5cf0\u503c\u3002"
+                "\u5f20\u5634\u6a21\u5f0f\u53ef\u8c03\u5634\u5df4\u68c0\u6d4b\u95f4\u9694\uff1b\u58f0\u97f3\u6a21\u5f0f\u53ef\u8c03\u54cd\u6307\u9608\u503c\uff08100-10000\uff09\u548c\u68c0\u6d4b\u95f4\u9694\uff0810-2000ms\uff09\u3002\u62d6\u52a8\u540e\u4f1a\u7acb\u5373\u751f\u6548\u3002"
         ), matchWrap());
 
         refreshSettingLabels();
@@ -382,6 +450,8 @@ public class MainActivity extends Activity {
         String service = BlinkDetectionService.isRunning() ? "\u8bc6\u522b\u4e2d" : "\u672a\u8fd0\u884c";
         String mode = BlinkSettings.getDetectionModeLabel(this);
         int mouthIntervalMs = BlinkSettings.getMouthIntervalMs(this);
+        int soundThreshold = BlinkSettings.getSoundThreshold(this);
+        int soundIntervalMs = BlinkSettings.getSoundIntervalMs(this);
 
         statusView.setText(
                 "\u76f8\u673a\u6743\u9650\uff1a" + camera
@@ -392,6 +462,8 @@ public class MainActivity extends Activity {
                         + "\n\u9501\u5c4f\u6216\u7184\u5c4f\uff1a\u81ea\u52a8\u5f85\u673a\u505c\u6b62\u68c0\u6d4b"
                         + "\n\u5f53\u524d\u6a21\u5f0f\uff1a" + mode
                         + "\n\u5634\u5df4\u68c0\u6d4b\u95f4\u9694\uff1a" + mouthIntervalMs + "ms"
+                        + "\n\u54cd\u6307\u9608\u503c\uff1a" + soundThreshold
+                        + "\n\u54cd\u6307\u68c0\u6d4b\u95f4\u9694\uff1a" + soundIntervalMs + "ms"
         );
 
         if (startButton != null) {
@@ -416,6 +488,14 @@ public class MainActivity extends Activity {
         if (mouthIntervalValueView != null) {
             mouthIntervalValueView.setText("\u5634\u5df4\u68c0\u6d4b\u95f4\u9694\uff1a"
                     + BlinkSettings.getMouthIntervalMs(this) + "ms");
+        }
+        if (soundThresholdValueView != null) {
+            soundThresholdValueView.setText("\u54cd\u6307\u9608\u503c\uff1a"
+                    + BlinkSettings.getSoundThreshold(this));
+        }
+        if (soundIntervalValueView != null) {
+            soundIntervalValueView.setText("\u54cd\u6307\u68c0\u6d4b\u95f4\u9694\uff1a"
+                    + BlinkSettings.getSoundIntervalMs(this) + "ms");
         }
         if (mouthModeButton != null) {
             mouthModeButton.setText(mode == BlinkSettings.MODE_MOUTH

@@ -23,11 +23,16 @@ import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CaptureRequest;
 import android.hardware.camera2.params.StreamConfigurationMap;
+import android.media.AudioDeviceInfo;
 import android.media.AudioFormat;
+import android.media.AudioManager;
 import android.media.AudioRecord;
 import android.media.MediaRecorder;
 import android.media.Image;
 import android.media.ImageReader;
+import android.media.audiofx.AcousticEchoCanceler;
+import android.media.audiofx.AutomaticGainControl;
+import android.media.audiofx.NoiseSuppressor;
 import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -62,11 +67,20 @@ public class BlinkDetectionService extends Service {
     private static final String CHANNEL_ID = "blink_detection";
     private static final int NOTIFICATION_ID = 1001;
     private static final long SWIPE_COOLDOWN_MS = 1800;
-    private static final float MOUTH_OPEN_RATIO_THRESHOLD = 0.055f;
-    private static final int SOUND_SAMPLE_RATE = 16000;
-    private static final int SNAP_MIN_PEAK = 9000;
-    private static final int SNAP_MIN_DELTA = 5500;
-    private static final float SNAP_MIN_RATIO = 4.5f;
+    private static final float FACE_CHANGE_TRIGGER_SCORE = 0.18f;
+    private static final float FACE_CHANGE_RESET_SCORE = 0.08f;
+    private static final long FRAME_PROCESSING_TIMEOUT_MS = 5000;
+    private static final long CAMERA_STALE_TIMEOUT_MS = 12000;
+    private static final long CAMERA_RESTART_COOLDOWN_MS = 10000;
+    private static final int SOUND_SAMPLE_RATE = 22050;
+    private static final int SOUND_ANALYSIS_WINDOW_MS = 10;
+    private static final float SNAP_DELTA_RATIO = 0.58f;
+    private static final float SNAP_MIN_RATIO = 3.6f;
+    private static final float SNAP_MIN_CREST = 2.6f;
+    private static final float SNAP_MIN_EDGE_RATIO = 0.10f;
+    private static final float SNAP_MIN_STRONG_FRACTION = 0.015f;
+    private static final float SNAP_MAX_STRONG_FRACTION = 0.22f;
+    private static final long SNAP_REFRACTORY_MS = 900;
     private static final String MODE_IDLE = "IDLE";
     private static final String MODE_MOUTH = "MOUTH";
     private static final String MODE_SOUND = "SOUND";
@@ -92,17 +106,32 @@ public class BlinkDetectionService extends Service {
     private volatile boolean processingFrame;
     private long lastFrameAt;
     private long lastSwipeAt;
+    private long lastCameraImageAt;
+    private long lastCameraRestartAt;
+    private long lastFaceChangeTriggerAt;
     private long lastNotificationAt;
     private long lastFaceLogAt;
     private long lastNoFaceLogAt;
     private long lastSoundLogAt;
+    private long lastSnapAcceptedAt;
+    private long lastSoundAnalyzeAt;
     private boolean mouthOpen;
+    private boolean faceChangeActive;
     private boolean foregroundStarted;
     private HandlerThread audioThread;
     private Handler audioHandler;
     private AudioRecord audioRecord;
+    private String audioSourceLabel = "VOICE_RECOGNITION";
+    private AcousticEchoCanceler acousticEchoCanceler;
+    private NoiseSuppressor noiseSuppressor;
+    private AutomaticGainControl automaticGainControl;
+    private boolean communicationAudioMode;
     private volatile boolean audioRunning;
     private double soundNoiseFloor = 700.0;
+    private Float lastFaceCenterX;
+    private Float lastFaceCenterY;
+    private Float lastFaceSizeRatio;
+    private Float lastFaceMouthRatio;
     private boolean receiverRegistered;
     private volatile boolean stoppingForScreenOff;
     private String activeMode = MODE_IDLE;
@@ -126,6 +155,7 @@ public class BlinkDetectionService extends Service {
                 stopDetectionForScreenOff("power watchdog");
                 return;
             }
+            checkCameraHealth();
             powerHandler.postDelayed(this, 1000);
         }
     };
@@ -280,6 +310,12 @@ public class BlinkDetectionService extends Service {
         stopAudioDetection();
         closeCamera();
         mouthOpen = false;
+        faceChangeActive = false;
+        lastFaceChangeTriggerAt = 0L;
+        lastFaceCenterX = null;
+        lastFaceCenterY = null;
+        lastFaceSizeRatio = null;
+        lastFaceMouthRatio = null;
         activeMode = MODE_IDLE;
         updateNotification("Stopped: screen off");
         DebugLog.add(this, (hadActiveMode ? "Detection paused" : "Standby")
@@ -293,9 +329,9 @@ public class BlinkDetectionService extends Service {
 
         stopAudioDetection();
         activeMode = MODE_MOUTH;
-        DebugLog.add(this, "Mouth mode active reason=" + reason
+        DebugLog.add(this, "Face change mode active reason=" + reason
                 + " interval=" + BlinkSettings.getMouthIntervalMs(this)
-                + "ms openRatio>=" + MOUTH_OPEN_RATIO_THRESHOLD);
+                + "ms faceChange>=" + FACE_CHANGE_TRIGGER_SCORE);
         startCamera();
     }
 
@@ -323,6 +359,9 @@ public class BlinkDetectionService extends Service {
         try {
             closeCamera();
             ensureCameraThread();
+            resetFaceChangeState();
+            lastFrameAt = 0L;
+            lastCameraImageAt = SystemClock.elapsedRealtime();
 
             CameraManager cameraManager = (CameraManager) getSystemService(CAMERA_SERVICE);
             CameraConfig config = findFrontCamera(cameraManager);
@@ -430,7 +469,7 @@ public class BlinkDetectionService extends Service {
             requestBuilder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO);
             captureSession.setRepeatingRequest(requestBuilder.build(), null, cameraHandler);
             running = true;
-            updateNotification("Detecting open mouth");
+            updateNotification("Detecting face change");
             DebugLog.add(this, "Camera repeating request started");
         } catch (CameraAccessException exception) {
             Log.w(TAG, "Unable to start camera repeating request", exception);
@@ -446,6 +485,12 @@ public class BlinkDetectionService extends Service {
         }
 
         long now = SystemClock.elapsedRealtime();
+        lastCameraImageAt = now;
+        if (processingFrame && now - lastFrameAt > FRAME_PROCESSING_TIMEOUT_MS) {
+            DebugLog.add(this, "Frame processing timeout, reset processor");
+            processingFrame = false;
+        }
+
         int mouthIntervalMs = BlinkSettings.getMouthIntervalMs(this);
         if (processingFrame || now - lastFrameAt < mouthIntervalMs) {
             image.close();
@@ -484,43 +529,110 @@ public class BlinkDetectionService extends Service {
                 DebugLog.add(this, "No face detected. faces=" + faces.size());
             }
             mouthOpen = false;
+            resetFaceChangeState();
             return;
         }
 
         Float mouthOpenRatio = getMouthOpenRatio(face);
-        if (mouthOpenRatio == null) {
-            if (now - lastFaceLogAt > 2000) {
-                lastFaceLogAt = now;
-                DebugLog.add(this, "Face found but mouth contours unavailable");
+        Rect bounds = face.getBoundingBox();
+        float faceWidth = Math.max(1f, bounds.width());
+        float faceHeight = Math.max(1f, bounds.height());
+        float faceSize = Math.max(faceWidth, faceHeight);
+        float centerX = bounds.exactCenterX();
+        float centerY = bounds.exactCenterY();
+        float frameSize = Math.max(1f, imageReader != null
+                ? Math.max(imageReader.getWidth(), imageReader.getHeight())
+                : faceSize);
+        float sizeRatio = faceSize / frameSize;
+        float moveScore = 0f;
+        float sizeScore = 0f;
+        float mouthScore = 0f;
+
+        if (lastFaceCenterX != null && lastFaceCenterY != null && lastFaceSizeRatio != null) {
+            float dx = centerX - lastFaceCenterX;
+            float dy = centerY - lastFaceCenterY;
+            moveScore = (float) (Math.hypot(dx, dy) / faceSize);
+            sizeScore = Math.abs(sizeRatio - lastFaceSizeRatio);
+            if (mouthOpenRatio != null && lastFaceMouthRatio != null) {
+                mouthScore = Math.abs(mouthOpenRatio - lastFaceMouthRatio);
             }
-            return;
         }
 
-        boolean wasMouthOpen = mouthOpen;
-        mouthOpen = mouthOpenRatio >= MOUTH_OPEN_RATIO_THRESHOLD;
+        float faceChangeScore = moveScore * 0.65f + sizeScore * 1.6f + mouthScore * 1.8f;
+        boolean wasFaceChangeActive = faceChangeActive;
+        faceChangeActive = faceChangeScore >= FACE_CHANGE_TRIGGER_SCORE;
+        if (faceChangeScore <= FACE_CHANGE_RESET_SCORE) {
+            faceChangeActive = false;
+        }
+        mouthOpen = faceChangeActive;
 
         if (now - lastFaceLogAt > 2000) {
             lastFaceLogAt = now;
             DebugLog.add(this, String.format(Locale.US,
-                    "faces=%d mouthRatio=%.3f open=%s interval=%dms accessibility=%s",
-                    faces.size(), mouthOpenRatio, mouthOpen, BlinkSettings.getMouthIntervalMs(this),
+                    "faces=%d change=%.3f move=%.3f size=%.3f mouth=%.3f active=%s interval=%dms accessibility=%s",
+                    faces.size(), faceChangeScore, moveScore, sizeScore, mouthScore,
+                    faceChangeActive, BlinkSettings.getMouthIntervalMs(this),
                     BlinkAccessibilityService.isReady()));
         }
 
-        if (!wasMouthOpen && mouthOpen) {
-            DebugLog.add(this, String.format(Locale.US, "Mouth opened ratio=%.3f", mouthOpenRatio));
-        }
-        if (wasMouthOpen && !mouthOpen) {
-            DebugLog.add(this, String.format(Locale.US, "Mouth closed ratio=%.3f", mouthOpenRatio));
+        if (faceChangeActive && now - lastFaceChangeTriggerAt >= SWIPE_COOLDOWN_MS) {
+            lastFaceChangeTriggerAt = now;
+            DebugLog.add(this, String.format(Locale.US,
+                    "Face change detected change=%.3f move=%.3f size=%.3f mouth=%.3f",
+                    faceChangeScore, moveScore, sizeScore, mouthScore));
+            triggerSwipe("Face change");
+            resetFaceChangeBaseline(centerX, centerY, sizeRatio, mouthOpenRatio);
+            faceChangeActive = false;
+            return;
+        } else if (wasFaceChangeActive && !faceChangeActive) {
+            DebugLog.add(this, String.format(Locale.US,
+                    "Face change reset change=%.3f", faceChangeScore));
         }
 
-        if (!wasMouthOpen && mouthOpen) {
-            DebugLog.add(this, "Open mouth detected");
-            triggerSwipe("Open mouth");
-        } else if (now - lastNotificationAt > 5000) {
+        if (now - lastNotificationAt > 5000) {
             updateNotification(BlinkAccessibilityService.isReady()
-                    ? "Detecting open mouth"
+                    ? "Detecting face change"
                     : "Waiting for accessibility");
+        }
+
+        resetFaceChangeBaseline(centerX, centerY, sizeRatio, mouthOpenRatio);
+    }
+
+    private void resetFaceChangeState() {
+        faceChangeActive = false;
+        lastFaceCenterX = null;
+        lastFaceCenterY = null;
+        lastFaceSizeRatio = null;
+        lastFaceMouthRatio = null;
+    }
+
+    private void resetFaceChangeBaseline(float centerX, float centerY, float sizeRatio,
+            Float mouthOpenRatio) {
+        lastFaceCenterX = centerX;
+        lastFaceCenterY = centerY;
+        lastFaceSizeRatio = sizeRatio;
+        lastFaceMouthRatio = mouthOpenRatio;
+    }
+
+    private void checkCameraHealth() {
+        if (!MODE_MOUTH.equals(activeMode) || !running || stoppingForScreenOff) {
+            return;
+        }
+
+        long now = SystemClock.elapsedRealtime();
+        if (processingFrame && now - lastFrameAt > FRAME_PROCESSING_TIMEOUT_MS) {
+            processingFrame = false;
+            DebugLog.add(this, "Camera watchdog reset stuck frame processor");
+        }
+
+        boolean cameraMissing = cameraDevice == null || captureSession == null || imageReader == null;
+        boolean cameraStale = lastCameraImageAt > 0 && now - lastCameraImageAt > CAMERA_STALE_TIMEOUT_MS;
+        if ((cameraMissing || cameraStale) && now - lastCameraRestartAt > CAMERA_RESTART_COOLDOWN_MS) {
+            lastCameraRestartAt = now;
+            DebugLog.add(this, "Camera watchdog restart missing=" + cameraMissing
+                    + " stale=" + cameraStale);
+            closeCamera();
+            startCamera();
         }
     }
 
@@ -586,28 +698,29 @@ public class BlinkDetectionService extends Service {
 
         int bufferSize = Math.max(minBufferSize, SOUND_SAMPLE_RATE / 4);
         try {
-            audioRecord = new AudioRecord(
-                    MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                    SOUND_SAMPLE_RATE,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    bufferSize
-            );
+            enterCommunicationAudioMode();
+            audioRecord = createAudioRecord(bufferSize);
             if (audioRecord.getState() != AudioRecord.STATE_INITIALIZED) {
                 DebugLog.add(this, "AudioRecord init failed state=" + audioRecord.getState());
                 stopAudioDetection();
                 stopSelf();
                 return;
             }
+            bindPreferredInputDevice(audioRecord);
+            attachAudioPreprocessors(audioRecord);
 
             audioThread = new HandlerThread("SnapAudio");
             audioThread.start();
             audioHandler = new Handler(audioThread.getLooper());
             audioRunning = true;
             running = true;
+            lastSoundAnalyzeAt = 0L;
             updateNotification("Detecting finger snap");
             DebugLog.add(this, "Audio detection started sampleRate=" + SOUND_SAMPLE_RATE
-                    + " buffer=" + bufferSize);
+                    + " buffer=" + bufferSize
+                    + " threshold=" + BlinkSettings.getSoundThreshold(this)
+                    + " interval=" + BlinkSettings.getSoundIntervalMs(this) + "ms"
+                    + " source=" + audioSourceLabel);
             audioHandler.post(() -> readAudioLoop(bufferSize));
         } catch (RuntimeException exception) {
             Log.w(TAG, "Unable to start audio detection", exception);
@@ -617,8 +730,163 @@ public class BlinkDetectionService extends Service {
         }
     }
 
+    private void enterCommunicationAudioMode() {
+        AudioManager audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
+        if (audioManager == null) {
+            return;
+        }
+        audioManager.setMode(AudioManager.MODE_IN_COMMUNICATION);
+        communicationAudioMode = true;
+        DebugLog.add(this, "Audio mode=MODE_IN_COMMUNICATION");
+    }
+
+    private AudioRecord createAudioRecord(int bufferSize) {
+        RuntimeException lastError = null;
+        int[] sources = Build.VERSION.SDK_INT >= Build.VERSION_CODES.N
+                ? new int[]{
+                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                MediaRecorder.AudioSource.MIC,
+                MediaRecorder.AudioSource.UNPROCESSED
+        }
+                : new int[]{
+                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                MediaRecorder.AudioSource.MIC
+        };
+
+        for (int source : sources) {
+            try {
+                AudioRecord record = new AudioRecord(
+                        source,
+                        SOUND_SAMPLE_RATE,
+                        AudioFormat.CHANNEL_IN_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT,
+                        bufferSize
+                );
+                if (record.getState() == AudioRecord.STATE_INITIALIZED) {
+                    audioSourceLabel = audioSourceToLabel(source);
+                    return record;
+                }
+                record.release();
+            } catch (RuntimeException exception) {
+                lastError = exception;
+            }
+        }
+
+        if (lastError != null) {
+            throw lastError;
+        }
+        audioSourceLabel = "UNAVAILABLE";
+        return new AudioRecord(
+                MediaRecorder.AudioSource.MIC,
+                SOUND_SAMPLE_RATE,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                bufferSize
+        );
+    }
+
+    private String audioSourceToLabel(int source) {
+        if (source == MediaRecorder.AudioSource.VOICE_COMMUNICATION) {
+            return "VOICE_COMMUNICATION_MIC";
+        }
+        if (source == MediaRecorder.AudioSource.UNPROCESSED) {
+            return "UNPROCESSED_MIC";
+        }
+        if (source == MediaRecorder.AudioSource.MIC) {
+            return "MIC";
+        }
+        if (source == MediaRecorder.AudioSource.VOICE_RECOGNITION) {
+            return "VOICE_RECOGNITION_MIC";
+        }
+        return "SOURCE_" + source;
+    }
+
+    private void bindPreferredInputDevice(AudioRecord record) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            return;
+        }
+        AudioManager audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
+        if (audioManager == null) {
+            return;
+        }
+
+        AudioDeviceInfo preferred = null;
+        for (AudioDeviceInfo deviceInfo : audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)) {
+            if (deviceInfo.getType() == AudioDeviceInfo.TYPE_BUILTIN_MIC) {
+                preferred = deviceInfo;
+                break;
+            }
+        }
+
+        if (preferred != null) {
+            boolean routed = record.setPreferredDevice(preferred);
+            DebugLog.add(this, "Preferred input="
+                    + deviceTypeToLabel(preferred.getType())
+                    + " routed=" + routed);
+        }
+    }
+
+    private void attachAudioPreprocessors(AudioRecord record) {
+        int audioSessionId = record.getAudioSessionId();
+
+        if (AcousticEchoCanceler.isAvailable()) {
+            acousticEchoCanceler = AcousticEchoCanceler.create(audioSessionId);
+            if (acousticEchoCanceler != null) {
+                acousticEchoCanceler.setEnabled(true);
+                DebugLog.add(this, "AEC enabled=" + acousticEchoCanceler.getEnabled());
+            } else {
+                DebugLog.add(this, "AEC create failed");
+            }
+        } else {
+            DebugLog.add(this, "AEC unavailable");
+        }
+
+        if (NoiseSuppressor.isAvailable()) {
+            noiseSuppressor = NoiseSuppressor.create(audioSessionId);
+            if (noiseSuppressor != null) {
+                noiseSuppressor.setEnabled(true);
+                DebugLog.add(this, "NS enabled=" + noiseSuppressor.getEnabled());
+            } else {
+                DebugLog.add(this, "NS create failed");
+            }
+        } else {
+            DebugLog.add(this, "NS unavailable");
+        }
+
+        if (AutomaticGainControl.isAvailable()) {
+            automaticGainControl = AutomaticGainControl.create(audioSessionId);
+            if (automaticGainControl != null) {
+                automaticGainControl.setEnabled(false);
+                DebugLog.add(this, "AGC enabled=" + automaticGainControl.getEnabled());
+            } else {
+                DebugLog.add(this, "AGC create failed");
+            }
+        } else {
+            DebugLog.add(this, "AGC unavailable");
+        }
+    }
+
+    private String deviceTypeToLabel(int type) {
+        if (type == AudioDeviceInfo.TYPE_BUILTIN_MIC) {
+            return "BUILTIN_MIC";
+        }
+        if (type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
+            return "BLUETOOTH_SCO";
+        }
+        if (type == AudioDeviceInfo.TYPE_WIRED_HEADSET) {
+            return "WIRED_HEADSET";
+        }
+        if (type == AudioDeviceInfo.TYPE_USB_DEVICE || type == AudioDeviceInfo.TYPE_USB_HEADSET) {
+            return "USB_MIC";
+        }
+        return "TYPE_" + type;
+    }
+
     private void readAudioLoop(int bufferSize) {
-        short[] buffer = new short[Math.max(256, bufferSize / 2)];
+        int analysisWindowSamples = soundWindowMsToSamples(SOUND_ANALYSIS_WINDOW_MS);
+        short[] buffer = new short[Math.max(analysisWindowSamples, Math.min(bufferSize / 2, analysisWindowSamples * 2))];
         try {
             audioRecord.startRecording();
             while (audioRunning && audioRecord != null) {
@@ -626,9 +894,16 @@ public class BlinkDetectionService extends Service {
                     powerHandler.post(() -> stopDetectionForScreenOff("audio loop"));
                     break;
                 }
-                int read = audioRecord.read(buffer, 0, buffer.length);
+                int read = audioRecord.read(buffer, 0, analysisWindowSamples);
                 if (read > 0) {
-                    handleAudioSamples(buffer, read);
+                    long now = SystemClock.elapsedRealtime();
+                    int intervalMs = BlinkSettings.getSoundIntervalMs(this);
+                    if (now - lastSoundAnalyzeAt >= intervalMs) {
+                        lastSoundAnalyzeAt = now;
+                        if (read >= 128) {
+                            handleAudioSamples(buffer, 0, read);
+                        }
+                    }
                 }
             }
         } catch (RuntimeException exception) {
@@ -637,39 +912,79 @@ public class BlinkDetectionService extends Service {
         }
     }
 
-    private void handleAudioSamples(short[] buffer, int read) {
+    private void handleAudioSamples(short[] buffer, int offset, int read) {
+        int snapPeakThreshold = BlinkSettings.getSoundThreshold(this);
+        int snapDeltaThreshold = Math.max(100, Math.round(snapPeakThreshold * SNAP_DELTA_RATIO));
         int peak = 0;
         long sum = 0;
-        for (int i = 0; i < read; i++) {
+        long deltaSum = 0;
+        int strongCount = 0;
+        int prev = 0;
+        for (int i = offset; i < offset + read; i++) {
             int value = Math.abs((int) buffer[i]);
             peak = Math.max(peak, value);
             sum += value;
+            if (i > offset) {
+                deltaSum += Math.abs(value - prev);
+            }
+            prev = value;
+        }
+
+        int strongThreshold = Math.max(4000, (int) (peak * 0.60f));
+        for (int i = offset; i < offset + read; i++) {
+            int value = Math.abs((int) buffer[i]);
+            if (value >= strongThreshold) {
+                strongCount++;
+            }
         }
 
         double average = sum / (double) read;
         soundNoiseFloor = soundNoiseFloor * 0.92 + average * 0.08;
         double ratio = peak / Math.max(1.0, soundNoiseFloor);
         double delta = peak - soundNoiseFloor;
+        double crest = peak / Math.max(1.0, average);
+        double edgeRatio = (deltaSum / (double) Math.max(1, read - 1)) / Math.max(1.0, average);
+        double strongFraction = strongCount / (double) Math.max(1, read);
         long now = SystemClock.elapsedRealtime();
 
         if (now - lastSoundLogAt > 2000) {
             lastSoundLogAt = now;
             DebugLog.add(this, String.format(Locale.US,
-                    "sound peak=%d noise=%.0f ratio=%.1f accessibility=%s",
-                    peak, soundNoiseFloor, ratio, BlinkAccessibilityService.isReady()));
+                    "sound peak=%d noise=%.0f ratio=%.1f crest=%.1f edge=%.1f strong=%.2f threshold=%d interval=%dms accessibility=%s source=%s",
+                    peak, soundNoiseFloor, ratio, crest, edgeRatio, strongFraction,
+                    snapPeakThreshold, BlinkSettings.getSoundIntervalMs(this),
+                    BlinkAccessibilityService.isReady(), audioSourceLabel));
         }
 
-        if (peak >= SNAP_MIN_PEAK && delta >= SNAP_MIN_DELTA && ratio >= SNAP_MIN_RATIO) {
+        if (now - lastSnapAcceptedAt < SNAP_REFRACTORY_MS) {
+            return;
+        }
+
+        if (peak >= snapPeakThreshold
+                && delta >= snapDeltaThreshold
+                && ratio >= SNAP_MIN_RATIO
+                && crest >= SNAP_MIN_CREST
+                && edgeRatio >= SNAP_MIN_EDGE_RATIO
+                && strongFraction >= SNAP_MIN_STRONG_FRACTION
+                && strongFraction <= SNAP_MAX_STRONG_FRACTION) {
+            lastSnapAcceptedAt = now;
             DebugLog.add(this, String.format(Locale.US,
-                    "Finger snap detected peak=%d noise=%.0f ratio=%.1f",
-                    peak, soundNoiseFloor, ratio));
+                    "Finger snap detected peak=%d noise=%.0f ratio=%.1f crest=%.1f edge=%.1f strong=%.2f threshold=%d interval=%dms source=%s",
+                    peak, soundNoiseFloor, ratio, crest, edgeRatio, strongFraction,
+                    snapPeakThreshold, BlinkSettings.getSoundIntervalMs(this), audioSourceLabel));
             triggerSwipe("Finger snap");
             soundNoiseFloor = Math.max(soundNoiseFloor, peak * 0.45);
         }
     }
 
+    private int soundWindowMsToSamples(int windowMs) {
+        return Math.max(128, Math.round(windowMs * SOUND_SAMPLE_RATE / 1000f));
+    }
+
     private void stopAudioDetection() {
         audioRunning = false;
+        lastSoundAnalyzeAt = 0L;
+        releaseAudioPreprocessors();
 
         if (audioRecord != null) {
             try {
@@ -682,6 +997,8 @@ public class BlinkDetectionService extends Service {
             audioRecord = null;
             DebugLog.add(this, "AudioRecord released");
         }
+        audioSourceLabel = "VOICE_RECOGNITION";
+        leaveCommunicationAudioMode();
 
         if (audioThread != null) {
             audioThread.quitSafely();
@@ -694,6 +1011,33 @@ public class BlinkDetectionService extends Service {
             audioHandler = null;
             DebugLog.add(this, "Audio thread stopped");
         }
+    }
+
+    private void releaseAudioPreprocessors() {
+        if (acousticEchoCanceler != null) {
+            acousticEchoCanceler.release();
+            acousticEchoCanceler = null;
+        }
+        if (noiseSuppressor != null) {
+            noiseSuppressor.release();
+            noiseSuppressor = null;
+        }
+        if (automaticGainControl != null) {
+            automaticGainControl.release();
+            automaticGainControl = null;
+        }
+    }
+
+    private void leaveCommunicationAudioMode() {
+        if (!communicationAudioMode) {
+            return;
+        }
+        AudioManager audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
+        if (audioManager != null) {
+            audioManager.setMode(AudioManager.MODE_NORMAL);
+        }
+        communicationAudioMode = false;
+        DebugLog.add(this, "Audio mode=MODE_NORMAL");
     }
 
     private Face chooseFace(List<Face> faces) {
@@ -764,6 +1108,8 @@ public class BlinkDetectionService extends Service {
 
     private void closeCamera() {
         processingFrame = false;
+        lastCameraImageAt = 0L;
+        resetFaceChangeState();
 
         if (captureSession != null) {
             try {
@@ -844,7 +1190,7 @@ public class BlinkDetectionService extends Service {
                 "Mouth detection",
                 NotificationManager.IMPORTANCE_LOW
         );
-        channel.setDescription("Front camera mouth detection service");
+        channel.setDescription("Front camera face change detection service");
         NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         manager.createNotificationChannel(channel);
     }
